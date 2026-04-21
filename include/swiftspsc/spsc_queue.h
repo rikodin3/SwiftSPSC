@@ -4,9 +4,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <immintrin.h>
 #include <memory>
 #include <stdexcept>
-#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -36,59 +36,35 @@ public:
 
     [[nodiscard]] bool try_push(const T& value)
     {
-        if (is_full()) {
+        if (!reserve_enqueue_slot()) {
             return false;
         }
 
-        buffer_[local_tail_ & mask_] = value;
-        ++local_tail_;
-        
-        if (should_publish()) {
-            publish();
-        }
+        store_item(value);
+        commit_enqueue();
         return true;
     }
 
     [[nodiscard]] bool try_push(T&& value)
     {
-        if (is_full()) {
+        if (!reserve_enqueue_slot()) {
             return false;
         }
 
-        if constexpr (std::is_move_assignable_v<T>) {
-            buffer_[local_tail_ & mask_] = std::move(value);
-        } else {
-            const T& as_const_ref = value;
-            buffer_[local_tail_ & mask_] = as_const_ref;
-        }
-
-        ++local_tail_;
-        
-        if (should_publish()) {
-            publish();
-        }
+        store_item(std::forward<T>(value));
+        commit_enqueue();
         return true;
     }
 
     template <typename... Args>
     [[nodiscard]] bool try_emplace(Args&&... args)
     {
-        if (is_full()) {
+        if (!reserve_enqueue_slot()) {
             return false;
         }
 
-        if constexpr (std::is_move_assignable_v<T>) {
-            buffer_[local_tail_ & mask_] = T(std::forward<Args>(args)...);
-        } else {
-            T temp(std::forward<Args>(args)...);
-            buffer_[local_tail_ & mask_] = temp;
-        }
-
-        ++local_tail_;
-        
-        if (should_publish()) {
-            publish();
-        }
+        store_item(T(std::forward<Args>(args)...));
+        commit_enqueue();
         return true;
     }
 
@@ -116,22 +92,7 @@ public:
 
     [[nodiscard]] bool try_pop(T& out)
     {
-        if (local_head_ == cached_tail_) {
-            cached_tail_ = tail_.load(std::memory_order_acquire);
-            if (local_head_ == cached_tail_) {
-                return false;
-            }
-        }
-
-        if constexpr (std::is_move_assignable_v<T>) {
-            out = std::move(buffer_[local_head_ & mask_]);
-        } else {
-            out = buffer_[local_head_ & mask_];
-        }
-
-        ++local_head_;
-        head_.store(local_head_, std::memory_order_release);
-        return true;
+        return dequeue_impl(out);
     }
 
     void pop(T& out)
@@ -141,7 +102,7 @@ public:
         }
     }
 
-    void flush()
+    void flush() noexcept
     {
         publish();
     }
@@ -164,6 +125,15 @@ public:
     }
 
 private:
+    struct ProducerCtx {
+        std::uint64_t local_tail = 0;
+        std::uint64_t cached_head = 0;
+        std::uint64_t last_published = 0;
+
+        static constexpr std::uint64_t BATCH_SIZE = 64;
+        static constexpr std::uint64_t MAX_UNPUBLISHED = 256;
+    };
+
     [[nodiscard]] static std::uint64_t validate_capacity(std::size_t capacity)
     {
         if (capacity == 0 || (capacity & (capacity - 1)) != 0) {
@@ -173,40 +143,77 @@ private:
         return static_cast<std::uint64_t>(capacity);
     }
 
-    [[nodiscard]] bool is_full()
+    [[nodiscard]] bool reserve_enqueue_slot()
     {
-        if (local_tail_ - cached_head_ < capacity_) {
+        const std::uint64_t used = producer_.local_tail - producer_.cached_head;
+        if (used < capacity_) {
             return false;
         }
 
-        cached_head_ = head_.load(std::memory_order_acquire);
-        return local_tail_ - cached_head_ >= capacity_;
+        producer_.cached_head = head_.load(std::memory_order_acquire);
+        return producer_.local_tail - producer_.cached_head < capacity_;
     }
 
-    static void spin_wait() noexcept
+    template <typename U>
+    void store_item(U&& value)
     {
-        std::this_thread::yield();
+        if constexpr (std::is_move_assignable_v<T>) {
+            buffer_[producer_.local_tail & mask_] = std::forward<U>(value);
+        } else {
+            const T& as_const_ref = value;
+            buffer_[producer_.local_tail & mask_] = as_const_ref;
+        }
     }
 
-    [[nodiscard]] bool should_publish() const noexcept
+    void commit_enqueue() noexcept
     {
-        if ((local_tail_ & (kBatchSize - 1)) == 0) {
-            return true;
+        ++producer_.local_tail;
+
+        bool publish_now = false;
+        if ((producer_.local_tail & (ProducerCtx::BATCH_SIZE - 1)) == 0) {
+            publish_now = true;
         }
-        if (local_tail_ - last_published_ >= kMaxUnpublished) {
-            return true;
+
+        if (producer_.local_tail - producer_.last_published >= ProducerCtx::MAX_UNPUBLISHED) {
+            publish_now = true;
         }
-        return false;
+
+        if (publish_now) {
+            publish();
+        }
+    }
+
+    [[nodiscard]] bool dequeue_impl(T& out)
+    {
+        if (local_head_ == cached_tail_) {
+            cached_tail_ = tail_.load(std::memory_order_acquire);
+
+            if (local_head_ == cached_tail_) {
+                return false;
+            }
+        }
+
+        if constexpr (std::is_move_assignable_v<T>) {
+            out = std::move(buffer_[local_head_ & mask_]);
+        } else {
+            out = buffer_[local_head_ & mask_];
+        }
+
+        ++local_head_;
+        head_.store(local_head_, std::memory_order_release);
+        return true;
+    }
+
+    static inline void spin_wait() noexcept
+    {
+        _mm_pause();
     }
 
     void publish() noexcept
     {
-        tail_.store(local_tail_, std::memory_order_release);
-        last_published_ = local_tail_;
+        tail_.store(producer_.local_tail, std::memory_order_release);
+        producer_.last_published = producer_.local_tail;
     }
-
-    static constexpr std::uint64_t kBatchSize = 64;
-    static constexpr std::uint64_t kMaxUnpublished = 256;
 
     alignas(kCacheLineSize) std::atomic<std::uint64_t> head_{0};
     alignas(kCacheLineSize) std::atomic<std::uint64_t> tail_{0};
@@ -214,9 +221,7 @@ private:
     alignas(kCacheLineSize) std::uint64_t local_head_{0};
     std::uint64_t cached_tail_{0};
 
-    alignas(kCacheLineSize) std::uint64_t local_tail_{0};
-    std::uint64_t cached_head_{0};
-    std::uint64_t last_published_{0};
+    alignas(kCacheLineSize) ProducerCtx producer_{};
 
     const std::uint64_t capacity_;
     const std::uint64_t mask_;
