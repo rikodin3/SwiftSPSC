@@ -42,7 +42,10 @@ public:
 
         buffer_[local_tail_ & mask_] = value;
         ++local_tail_;
-        tail_.store(local_tail_, std::memory_order_release);
+        
+        if (should_publish()) {
+            publish();
+        }
         return true;
     }
 
@@ -60,7 +63,10 @@ public:
         }
 
         ++local_tail_;
-        tail_.store(local_tail_, std::memory_order_release);
+        
+        if (should_publish()) {
+            publish();
+        }
         return true;
     }
 
@@ -79,7 +85,10 @@ public:
         }
 
         ++local_tail_;
-        tail_.store(local_tail_, std::memory_order_release);
+        
+        if (should_publish()) {
+            publish();
+        }
         return true;
     }
 
@@ -132,6 +141,11 @@ public:
         }
     }
 
+    void flush()
+    {
+        publish();
+    }
+
     [[nodiscard]] std::size_t size() const noexcept
     {
         const auto head = head_.load(std::memory_order_acquire);
@@ -174,6 +188,26 @@ private:
         std::this_thread::yield();
     }
 
+    [[nodiscard]] bool should_publish() const noexcept
+    {
+        if ((local_tail_ & (kBatchSize - 1)) == 0) {
+            return true;
+        }
+        if (local_tail_ - last_published_ >= kMaxUnpublished) {
+            return true;
+        }
+        return false;
+    }
+
+    void publish() noexcept
+    {
+        tail_.store(local_tail_, std::memory_order_release);
+        last_published_ = local_tail_;
+    }
+
+    static constexpr std::uint64_t kBatchSize = 64;
+    static constexpr std::uint64_t kMaxUnpublished = 256;
+
     alignas(kCacheLineSize) std::atomic<std::uint64_t> head_{0};
     alignas(kCacheLineSize) std::atomic<std::uint64_t> tail_{0};
 
@@ -182,6 +216,7 @@ private:
 
     alignas(kCacheLineSize) std::uint64_t local_tail_{0};
     std::uint64_t cached_head_{0};
+    std::uint64_t last_published_{0};
 
     const std::uint64_t capacity_;
     const std::uint64_t mask_;
